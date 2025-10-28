@@ -3,15 +3,20 @@ const router = express.Router();
 const axios = require('axios');
 const Fuse = require('fuse.js');
 const Medicine = require('../models/medicine');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-// Load environment variables (ensure .env has GOOGLE_API_KEY=your_api_key)
+const { GoogleGenerativeAI } = require('@google/generative-ai'); 
 require('dotenv').config();
 
-// Initialize Google Generative AI client
+// ✅ Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 
-// ✅ Route to add new medicine
+// ✅ Allowed Gemini models (latest, working as of Oct 2025)
+const allowedGeminiModels = [
+  "gemini-2.5-flash-lite-preview-06-17", // stable + free tier
+  "gemini-2.0-flash-exp",
+  "gemini-2.0-pro-exp"
+];
+
+// ✅ Add new medicine
 router.post('/', async (req, res) => {
   try {
     const { tabletName, quantityInStock, price, dosageFrequency, usageInstructions, foodWarnings } = req.body;
@@ -20,25 +25,17 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ msg: 'Tablet name and quantity are required.' });
     }
 
-    let medicine = await Medicine.findOne({ tabletName });
-    if (medicine) {
+    let existing = await Medicine.findOne({ tabletName });
+    if (existing) {
       return res.status(400).json({ msg: `Medicine '${tabletName}' already exists.` });
     }
 
-    medicine = new Medicine({
-      tabletName,
-      quantityInStock,
-      price,
-      dosageFrequency,
-      usageInstructions,
-      foodWarnings
-    });
+    const newMed = new Medicine({ tabletName, quantityInStock, price, dosageFrequency, usageInstructions, foodWarnings });
+    await newMed.save();
 
-    await medicine.save();
-    res.status(201).json({ msg: `'${tabletName}' added successfully.`, medicine });
-
+    res.status(201).json({ msg: `'${tabletName}' added successfully.`, medicine: newMed });
   } catch (err) {
-    console.error(err.message);
+    console.error('Error adding medicine:', err.message);
     if (err.code === 11000) {
       return res.status(400).json({ msg: `Medicine '${req.body.tabletName}' already exists.` });
     }
@@ -46,7 +43,7 @@ router.post('/', async (req, res) => {
   }
 });
 
-// ✅ Route to check medicine or find alternatives
+// ✅ Check medicine or find alternatives using Google Gemini
 router.get('/check', async (req, res) => {
   const { name, model } = req.query;
 
@@ -55,7 +52,7 @@ router.get('/check', async (req, res) => {
   }
 
   try {
-    // Step 1: Check for exact match in local stock
+    // 1️⃣ Exact local match
     const localMedicine = await Medicine.findOne({
       tabletName: new RegExp(`^${name}$`, 'i'),
       quantityInStock: { $gt: 0 }
@@ -69,13 +66,9 @@ router.get('/check', async (req, res) => {
       });
     }
 
-    // Step 2: Fuzzy match locally
-    const allMedicines = await Medicine.find({});
-    const fuse = new Fuse(allMedicines, {
-      keys: ['tabletName'],
-      threshold: 0.3
-    });
-
+    // 2️⃣ Fuzzy match in local DB
+    const all = await Medicine.find({});
+    const fuse = new Fuse(all, { keys: ['tabletName'], threshold: 0.3 });
     const fuzzyResults = fuse.search(name);
     const topFuzzy = fuzzyResults.slice(0, 3).map(r => r.item.tabletName);
 
@@ -87,13 +80,14 @@ router.get('/check', async (req, res) => {
       });
     }
 
-    // Step 3: Query Google Gemini
-    console.log(`'${name}' not found locally. Querying Google Gemini for alternatives...`);
-    const modelToUse = model || "gemini-1.5-flash";
-    const allowedGeminiModels = ["gemini-2.5-flash-lite-preview-06-17", "gemini-1.5-pro", "gemini-1.5-flash"];
+    // 3️⃣ Query Gemini for external suggestions
+    console.log(`'${name}' not found locally. Querying Google Gemini...`);
+    const modelToUse = model || "gemini-2.5-flash-lite-preview-06-17";
 
     if (!allowedGeminiModels.includes(modelToUse)) {
-      return res.status(400).json({ error: `Invalid Gemini model. Allowed: ${allowedGeminiModels.join(', ')}` });
+      return res.status(400).json({
+        error: `Invalid Gemini model. Allowed: ${allowedGeminiModels.join(', ')}`
+      });
     }
 
     let geminiAlternatives = [];
@@ -101,74 +95,57 @@ router.get('/check', async (req, res) => {
     try {
       const geminiModel = genAI.getGenerativeModel({ model: modelToUse });
 
-      const result = await geminiModel.generateContent({
-        contents: [{
-          role: "user",
-          parts: [{
-            text: `List up to 3 common therapeutic or generic alternatives for "${name}". 
-Only provide names separated by commas. If none, say "None".`
-          }]
-        }],
-        generationConfig: {
-          maxOutputTokens: 80,
-          temperature: 0.2
-        }
-      });
+      const prompt = `What are some generic or therapeutic alternatives for "${name}"? 
+      List up to 3 medicine names only, separated by commas. 
+      If none are known, just respond with "None".`;
 
-      const rawGeminiResponse = result.response.text().trim();
-      console.log("Raw Gemini Response:", rawGeminiResponse);
+      const result = await geminiModel.generateContent(prompt);
+      const rawResponse = result.response.text();
+      console.log("Raw Gemini Response:", rawResponse);
 
-      if (rawGeminiResponse && rawGeminiResponse.toLowerCase() !== "none") {
-        geminiAlternatives = rawGeminiResponse
-          .split(',')
-          .map(a => a.trim())
+      if (rawResponse && rawResponse.toLowerCase() !== "none") {
+        geminiAlternatives = rawResponse.split(',')
+          .map(x => x.trim())
           .filter(Boolean);
       }
-
-    } catch (apiError) {
-      console.error("⚠️ Gemini API Error:", apiError.message);
-      if (apiError.message.includes("429")) {
-        console.warn("Quota exceeded. Using fallback suggestions.");
-        geminiAlternatives = ["Paracetamol", "Ibuprofen", "Diclofenac"]; // fallback safe data
-      } else {
-        return res.status(502).json({
-          error: 'Error communicating with Google Gemini API.',
-          details: apiError.message
-        });
-      }
+    } catch (apiErr) {
+      console.error("❌ Gemini API Error:", apiErr.message);
+      return res.status(502).json({
+        error: 'Error communicating with Google Gemini API.',
+        details: apiErr.message
+      });
     }
 
-    const top3GeminiAlternatives = geminiAlternatives.slice(0, 3);
-    console.log("Gemini Suggested Alternatives:", top3GeminiAlternatives);
+    const top3 = geminiAlternatives.slice(0, 3);
+    console.log(`Gemini suggested: ${top3.join(', ') || 'None'}`);
 
-    // Step 4: Check stock for suggested alternatives
-    for (const altName of top3GeminiAlternatives) {
-      const alternativeInStock = await Medicine.findOne({
-        tabletName: new RegExp(`^${altName}$`, 'i'),
+    // 4️⃣ Check if any Gemini suggestion exists locally
+    for (const alt of top3) {
+      const inStock = await Medicine.findOne({
+        tabletName: new RegExp(`^${alt}$`, 'i'),
         quantityInStock: { $gt: 0 }
       });
-
-      if (alternativeInStock) {
+      if (inStock) {
         return res.json({
           status: 'alternative_available_locally',
-          message: `'${name}' not found, but Gemini suggested '${altName}' which is in stock. 
-⚠️ *Disclaimer: For informational purposes only. Consult a healthcare professional before substituting.*`,
-          data: alternativeInStock
+          message: `'${name}' is unavailable, but Gemini suggested an alternative that is in stock.`,
+          data: inStock,
+          disclaimer: 'Suggestions are informational only; consult a healthcare professional.'
         });
       }
     }
 
-    // Step 5: No matches found
+    // 5️⃣ None available locally or suggested
     return res.json({
-      status: 'not_available_locally_and_no_stocked_alternatives',
-      message: `'${name}' not found. Checked Gemini alternatives — none are in stock.`,
-      geminiSuggestions: top3GeminiAlternatives,
-      disclaimer: '⚠️ For informational purposes only. Please verify with a healthcare professional.'
+      status: 'not_available_anywhere',
+      message: `'${name}' is not in local stock. Gemini suggestions were checked but none are in stock.`,
+      geminiSuggestions: top3,
+      disclaimer: 'This information is for educational use; verify with a licensed pharmacist.'
     });
 
   } catch (err) {
-    console.error("Overall /check route error:", err.message);
-    res.status(500).json({ error: 'Server error', details: err.message });
+    console.error("🔥 Error in /check route:", err.message);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
